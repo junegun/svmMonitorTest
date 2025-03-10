@@ -12,6 +12,7 @@ use {
         env,
         process,
         thread,
+        os::unix::io::AsRawFd,
     },
 };
 
@@ -34,15 +35,40 @@ impl TransactionMonitor {
     }
 
     fn connect(&mut self) -> bool {
-        let bind_addr = format!("{}:{}", self.host, self.port);
-        match UdpSocket::bind(&bind_addr) {
-            Ok(socket) => {
-                println!("Successfully connected to {}", bind_addr);
+        // 먼저 임의의 포트에 바인딩
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to create UDP socket: {}", e);
+                return false;
+            }
+        };
+
+        // SO_REUSEADDR 옵션 설정 (Unix 시스템용)
+        unsafe {
+            let optval: libc::c_int = 1;
+            if libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&optval) as libc::socklen_t,
+            ) < 0 {
+                eprintln!("Failed to set SO_REUSEADDR");
+                return false;
+            }
+        }
+
+        // 모니터링할 주소에 연결
+        let target_addr = format!("{}:{}", self.host, self.port);
+        match socket.connect(&target_addr) {
+            Ok(_) => {
+                println!("Successfully connected to {}", target_addr);
                 self.socket = Some(socket);
                 true
             }
             Err(e) => {
-                eprintln!("Failed to bind UDP socket to {}: {}", bind_addr, e);
+                eprintln!("Failed to connect to {}: {}", target_addr, e);
                 eprintln!("Retrying in {} seconds...", RETRY_DELAY.as_secs());
                 false
             }
