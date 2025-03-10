@@ -7,13 +7,14 @@ use {
         instruction::CompiledInstruction,
     },
     std::{
-        net::UdpSocket,
         time::{SystemTime, UNIX_EPOCH, Duration},
         env,
         process,
         thread,
-        os::unix::io::AsRawFd,
+        sync::{Arc, Mutex},
     },
+    quinn::{Endpoint, ServerConfig, TransportConfig},
+    tokio::runtime::Runtime,
 };
 
 const BUFFER_SIZE: usize = 5232; // Solana max transaction size
@@ -22,7 +23,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 struct TransactionMonitor {
     host: String,
     port: u16,
-    socket: Option<UdpSocket>,
+    endpoint: Option<Endpoint>,
 }
 
 impl TransactionMonitor {
@@ -30,45 +31,38 @@ impl TransactionMonitor {
         Self { 
             host,
             port,
-            socket: None,
+            endpoint: None,
         }
     }
 
     fn connect(&mut self) -> bool {
-        // 먼저 임의의 포트에 바인딩
-        let socket = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to create UDP socket: {}", e);
-                return false;
-            }
-        };
+        // QUIC 설정
+        let mut transport_config = TransportConfig::default();
+        transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
 
-        // SO_REUSEADDR 옵션 설정 (Unix 시스템용)
-        unsafe {
-            let optval: libc::c_int = 1;
-            if libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&optval) as libc::socklen_t,
-            ) < 0 {
-                eprintln!("Failed to set SO_REUSEADDR");
-                return false;
-            }
-        }
+        // 자체 서명된 인증서 생성
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.serialize_der().unwrap();
+        let priv_key = cert.serialize_private_key_der();
+        let priv_key = rustls::PrivateKey(priv_key);
+        let cert_chain = vec![rustls::Certificate(cert_der)];
 
-        // 모니터링할 주소에 연결
-        let target_addr = format!("{}:{}", self.host, self.port);
-        match socket.connect(&target_addr) {
-            Ok(_) => {
-                println!("Successfully connected to {}", target_addr);
-                self.socket = Some(socket);
+        // 서버 설정
+        let server_config = ServerConfig::with_single_cert(cert_chain, priv_key)
+            .expect("Failed to create server config");
+        let mut server_config = server_config;
+        server_config.transport = Arc::new(transport_config);
+
+        // 엔드포인트 생성
+        let addr = format!("{}:{}", self.host, self.port).parse().unwrap();
+        match Endpoint::server(server_config, addr) {
+            Ok(endpoint) => {
+                println!("Successfully created QUIC endpoint at {}", addr);
+                self.endpoint = Some(endpoint);
                 true
             }
             Err(e) => {
-                eprintln!("Failed to connect to {}: {}", target_addr, e);
+                eprintln!("Failed to create QUIC endpoint: {}", e);
                 eprintln!("Retrying in {} seconds...", RETRY_DELAY.as_secs());
                 false
             }
@@ -123,39 +117,79 @@ impl TransactionMonitor {
         println!("Starting transaction monitor...");
         println!("Press Ctrl+C to stop monitoring");
 
-        loop {
-            // 연결이 없으면 재연결 시도
-            if self.socket.is_none() {
-                if !self.connect() {
-                    thread::sleep(RETRY_DELAY);
-                    continue;
+        let runtime = Runtime::new().unwrap();
+        let monitor = Arc::new(Mutex::new(self.clone()));
+
+        runtime.block_on(async {
+            // 초기 연결 시도
+            {
+                let mut monitor_lock = monitor.lock().unwrap();
+                if monitor_lock.endpoint.is_none() {
+                    monitor_lock.connect();
                 }
             }
 
-            let mut buffer = [0u8; BUFFER_SIZE];
-            
-            // 소켓이 Some인 경우에만 실행
-            if let Some(socket) = &self.socket {
-                match socket.recv(&mut buffer) {
-                    Ok(size) => {
-                        match bincode::deserialize::<Transaction>(&buffer[..size]) {
-                            Ok(transaction) => {
-                                self.print_transaction_info(&transaction);
+            loop {
+                let endpoint_option = {
+                    let monitor_lock = monitor.lock().unwrap();
+                    monitor_lock.endpoint.clone()
+                };
+
+                if let Some(endpoint) = endpoint_option {
+                    if let Some(connecting) = endpoint.accept().await {
+                        let monitor_clone = Arc::clone(&monitor);
+                        tokio::spawn(async move {
+                            match connecting.await {
+                                Ok(connection) => {
+                                    loop {
+                                        match connection.accept_bi().await {
+                                            Ok((mut _send, mut recv)) => {
+                                                match recv.read_to_end(BUFFER_SIZE).await {
+                                                    Ok(buffer) => {
+                                                        if let Ok(transaction) = bincode::deserialize::<Transaction>(&buffer) {
+                                                            let monitor_lock = monitor_clone.lock().unwrap();
+                                                            monitor_lock.print_transaction_info(&transaction);
+                                                        } else {
+                                                            println!("Failed to deserialize transaction");
+                                                            println!("Raw data (hex): {}", hex::encode(&buffer));
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        eprintln!("Error reading from stream: {}", e);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Error accepting stream: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("Connection failed: {}", e),
                             }
-                            Err(err) => {
-                                eprintln!("Failed to deserialize transaction: {}", err);
-                                println!("Raw data (hex): {}", hex::encode(&buffer[..size]));
-                            }
-                        }
+                        });
                     }
-                    Err(e) => {
-                        eprintln!("Error receiving packet: {}", e);
-                        // 소켓 에러 발생 시 재연결을 위해 socket을 None으로 설정
-                        self.socket = None;
+                } else {
+                    // 연결이 없으면 재연결 시도
+                    let mut monitor_lock = monitor.lock().unwrap();
+                    if !monitor_lock.connect() {
+                        drop(monitor_lock); // 락 해제
                         thread::sleep(RETRY_DELAY);
                     }
                 }
             }
+        });
+    }
+}
+
+// Clone 구현 추가
+impl Clone for TransactionMonitor {
+    fn clone(&self) -> Self {
+        Self {
+            host: self.host.clone(),
+            port: self.port,
+            endpoint: None, // 엔드포인트는 복제할 수 없으므로 None으로 설정
         }
     }
 }
